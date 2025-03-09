@@ -36,9 +36,13 @@ A comprehensive tool for generating news videos from articles, with automatic sc
 3. Install the required packages:
    ```bash
    pip install -r requirements.txt
-   pip install -r requirements.txt
    ```
-4. Set up the environment:
+4. Download Kokoro TTS model:
+   ```bash
+   wget https://github.com/nazdridoy/kokoro-tts/releases/download/v1.0.0/voices-v1.0.bin
+   wget https://github.com/nazdridoy/kokoro-tts/releases/download/v1.0.0/kokoro-v1.0.onnx
+   ```   
+5. Set up the environment:
      ```bash
      export PEXELS_API_KEY='your-pexels-api-key-here'
      ```
