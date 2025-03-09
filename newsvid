@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""
+NewsVid - A CLI tool for generating news videos from online articles using local AI.
+
+This script takes a URL to a news article and generates a complete news video using
+the Ollama AI server running locally. It extracts content from the URL, generates
+a news script, converts it to speech, downloads relevant background videos, and
+combines everything into a final news video with scrolling text overlay.
+
+Typical usage:
+    ./newsvid generate <url>
+
+The process involves several steps:
+1. Extract text content from the URL
+2. Generate a news script using Ollama's AI model
+3. Convert the script to speech using text-to-speech
+4. Extract keywords and download relevant background videos
+5. Combine videos with audio and add scrolling text overlay
+
+Configuration is handled through constants at the top of the file:
+- AI settings: AI_MODEL, AI_TEMPERATURE, MAX_TOKENS
+- Voice settings: VOICE_MODEL, VOICE_SPEED, VOICE_LANG
+- File paths: OUTPUT_DIR, VIDEO_DIR, SCRIPT_FILE
+
+All generated files are organized in output directories named after the news title.
+No external configuration files are required.
+"""
+
+import requests
+import os
+import click
+import subprocess
+import tempfile
+from typing import List,  Optional
+from bs4 import BeautifulSoup
+from openai import OpenAI
+from functools import lru_cache
+from download import  search_and_download_videos
+from vid import combine_videos_with_audio, get_video_info
+from tts import convert_text_to_audio
+
+# Application constants
+USER_AGENT = "NewsVidApp/1.0 Python-Requests/2.25.1"
+OLLAMA_BASE_URL = "http://localhost:11434"
+MAX_TOKENS = 4096
+NUM_KEYWORDS = 8
+AI_MODEL = "gemma2"
+AI_TEMPERATURE = 0.3
+VOICE_MODEL = "am_fenrir,am_michael"
+VOICE_SPEED = 1.0
+VOICE_LANG = "en-us"
+VOICE_FORMAT = "mp3"
+OUTPUT_DIR = "output"
+VIDEO_DIR = "videos"
+SCRIPT_FILE = "script.txt"
+AUDIO_FILE = "news.mp3"
+
+# Error messages
+ERR_OLLAMA_SERVER = "Could not connect to Ollama server"
+ERR_SCRIPT_GEN = "Failed to generate script"
+ERR_TITLE_GEN = "Failed to create title"
+ERR_KEYWORD_GEN = "Failed to extract keywords"
+ERR_AUDIO_GEN = "Failed to create audio file"
+ERR_VIDEO_GEN = "Failed to download any videos"
+ERR_URL_EXTRACT = "Failed to extract content from URL"
+ERR_PIP_VIDEO = "Failed to create picture-in-picture video"
+
+def init_ollama_client() -> OpenAI:
+    """
+    Initialize OpenAI client configured to use local Ollama server.
+    
+    Returns:
+        OpenAI client instance configured to use OLLAMA_BASE_URL.
+        No API key is required for local Ollama server.
+    """
+    return OpenAI(
+        base_url=f"{OLLAMA_BASE_URL}/v1",
+        api_key="no-key-required"  # Ollama doesn't require an API key
+    )
+
+def verify_ollama_server() -> bool:
+    """
+    Verify that the Ollama server is running and accessible.
+    
+    Returns:
+        True if the server is running and accessible, False otherwise.
+        Errors are logged using click.echo.
+        
+    Note:
+        This function should be called before any AI operations
+        that require the Ollama server.
+    """
+    try:
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags")
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        click.echo(f"Error: {ERR_OLLAMA_SERVER} at {OLLAMA_BASE_URL}: {str(e)}", err=True)
+        return False
+
+def get_user_agent() -> str:
+    """
+    Get User-Agent string for HTTP requests.
+    
+    Returns:
+        User agent string defined in USER_AGENT constant.
+    """
+    return USER_AGENT
+
+@lru_cache(maxsize=100)
+def extract_text_from_url(url: str) -> str:
+    """
+    Extract readable text content from a URL using BeautifulSoup.
+    
+    Args:
+        url: The URL to extract text from
+        
+    Returns:
+        Extracted and cleaned text content from the URL.
+        Returns an empty string if extraction fails.
+        
+    Note:
+        - Uses lru_cache to cache results
+        - Removes script and style elements
+        - Cleans up whitespace and formatting
+        - Uses USER_AGENT for HTTP requests
+    """
+    try:
+        # Use the same user agent as our other requests
+        headers = {"User-Agent": get_user_agent()}
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        # Parse the HTML content
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        # Get text content
+        text = soup.get_text(separator=' ', strip=True)
+        
+        # Clean up whitespace
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        return text
+        
+    except Exception as e:
+        click.echo(f"Error: {ERR_URL_EXTRACT} {url}: {str(e)}", err=True)
+        return ""
+
+def extract_keywords(text: str, output_dir: str) -> List[str]:
+    """
+    Extract the top keywords from a text string using the configured AI model.
+    
+    Args:
+        text: The text to extract keywords from
+        output_dir: Directory to save the keywords.txt file
+        
+    Returns:
+        List of exactly NUM_KEYWORDS keywords as strings. The first keyword is 
+        typically the location of the news story if it can be determined.
+        Returns an empty list if extraction fails.
+        
+    Note:
+        - Uses the AI_MODEL and AI_TEMPERATURE settings for keyword generation
+        - Excludes proper nouns from the keywords
+        - Saves keywords to 'keywords.txt' in the output_dir for video downloads
+        - Requires a running Ollama server at OLLAMA_BASE_URL
+    """
+    try:
+        # Verify Ollama server is running
+        if not verify_ollama_server():
+            return []
+            
+        # Initialize Ollama client
+        client = init_ollama_client()
+        
+        # Create prompt for keyword extraction
+        prompt = f"Extract exactly {NUM_KEYWORDS} most important keywords from the following text. The keywords must not be proper nouns. The first keyword is the location of the piece of text, if it can be figured out. Return only the keywords, one per line, without numbers or any other text:\n\n {text}"
+        
+        # Call Ollama model
+        response = client.chat.completions.create(
+            model=AI_MODEL,  # Using Gemma2 model from Ollama
+            messages=[
+                {"role": "system", "content": "You are a keyword extraction specialist. Extract only the most important keywords or key phrases from the given text."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=100,  # Keywords should be concise
+            temperature=AI_TEMPERATURE  # Lower temperature for more focused results
+        )
+        
+        # Extract keywords from response
+        result = response.choices[0].message.content.strip()
+        keywords = [keyword.strip() for keyword in result.split('\n') if keyword.strip()]
+
+        # Save keywords to keywords.txt file
+        with open(f"{output_dir}/keywords.txt", 'w') as f:
+            for keyword in keywords:
+                f.write(f"{keyword}\n")
+
+
+        # Return exactly the number of keywords requested
+        return keywords[:NUM_KEYWORDS]
+        
+    except Exception as e:
+        print(f"Error extracting keywords: {str(e)}")
+        return []
+
+def create_title(text: str) -> str:
+    """
+    Generate a concise title (4-6 words) from text using the configured AI model.
+    
+    Args:
+        text: The text to generate a title from
+        
+    Returns:
+        A lowercase string with spaces replaced by underscores.
+        Returns 'untitled_content' if title generation fails.
+        
+    Note:
+        - Uses the AI_MODEL and AI_TEMPERATURE settings for title generation
+        - Requires a running Ollama server at OLLAMA_BASE_URL
+        - The title is used as the directory name for output files
+    """
+    try:
+        # Verify Ollama server is running
+        if not verify_ollama_server():
+            return "untitled_content"
+            
+        # Initialize Ollama client
+        client = init_ollama_client()
+        
+        # Create prompt for title generation
+        prompt = f"Create a short, concise title (4-6 words) for the following text. Return only the title, nothing else:\n\n{text}"
+        
+        # Call Ollama model
+        response = client.chat.completions.create(
+            model=AI_MODEL,  # Using Gemma2 model from Ollama
+            messages=[
+                {"role": "system", "content": "You are a title generation specialist. Create concise, descriptive titles."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=50,  # Titles should be very short
+            temperature=AI_TEMPERATURE  # Lower temperature for more focused results
+        )
+        
+        # Extract title from response
+        title = response.choices[0].message.content.strip()
+        
+        # Convert to lowercase and replace spaces with underscores
+        formatted_title = title.lower().replace(' ', '_')
+        
+        # Remove any punctuation
+        formatted_title = ''.join(c for c in formatted_title if c.isalnum() or c == '_')
+        
+        return formatted_title
+        
+    except Exception as e:
+        print(f"Error generating title: {str(e)}")
+        return "untitled_content"
+
+
+def generate_script(prompt: str, url: Optional[str] = None) -> str:
+    """
+    Generate a news script from a URL using the configured AI model.
+    
+    Args:
+        prompt: Instructions for script generation
+        url: URL to extract news content from (optional)
+        
+    Returns:
+        Generated news script as a string.
+        Returns an empty string if script generation fails.
+        
+    Note:
+        - Uses the AI_MODEL and AI_TEMPERATURE settings for script generation
+        - Uses MAX_TOKENS to limit the length of the generated script
+        - Requires a running Ollama server at OLLAMA_BASE_URL
+        - If URL is provided, extracts content and uses it as context
+        - The script follows a standard format:
+          * Starts with 'Welcome to the Daily News Show'
+          * Includes a clear title and location
+          * Is concise and engaging
+          * Limited to approximately 2 minutes when read
+          * Ends with 'Thank you for listening'
+          * Excludes specific names and dates
+    """
+    try:
+        # Verify Ollama server is running
+        if not verify_ollama_server():
+            return ""
+            
+        # Initialize Ollama client
+        client = init_ollama_client()
+        
+        # If URL is provided, extract its content and add to context
+        if url:
+            url_content = extract_text_from_url(url)
+
+            if url_content:
+                context = f"Content from {url}:\n\n{url_content}\n\nBased on the above content, {prompt}"
+            else:
+                context = f"Unable to extract content from {url}. Proceeding with original prompt: {prompt}"
+        else:
+            context = prompt        
+
+        # Call Ollama model
+        response = client.chat.completions.create(
+            model=AI_MODEL,  # Using Gemma2 model from Ollama
+            messages=[
+                {"role": "system", "content": "You are a new script writer who writes scripts for news anchors. You take in text content and convert it into a script that is read by a news anchor."},
+                {"role": "user", "content": context}
+            ],
+            max_tokens=MAX_TOKENS,
+            temperature=AI_TEMPERATURE  # Lower temperature for more focused results
+        )
+        
+        # Extract the response
+        result = response.choices[0].message.content.strip()
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Error creating news script: {str(e)}"
+        print(error_msg)
+        return error_msg
+
+
+@click.group()
+def cli():
+    """
+    NewsVid CLI - Create AI-powered news videos from online articles using Ollama.
+    
+    This tool uses a local Ollama server to generate news videos from online articles.
+    All configuration is handled through constants at the top of the script, no
+    external configuration files are required.
+    
+    Main command:
+        generate <url>: Create a complete news video from a URL
+    
+    Configuration:
+        - AI settings: AI_MODEL, AI_TEMPERATURE, MAX_TOKENS
+        - Voice settings: VOICE_MODEL, VOICE_SPEED, VOICE_LANG
+        - File paths: OUTPUT_DIR, VIDEO_DIR, SCRIPT_FILE
+    
+    Requirements:
+        - Ollama server running at OLLAMA_BASE_URL
+        - Internet access for URL content and video downloads
+        - Sufficient disk space for video processing
+    """
+    pass
+
+@cli.command()
+@click.argument('url')
+def generate(url: str):
+    """
+    Generate a complete news video from a URL.
+    
+    This command performs the entire pipeline:
+    1. Extracts text content from the URL
+    2. Generates a news script using AI
+    3. Creates a unique title and output directory
+    4. Converts the script to speech using text-to-speech
+    5. Extracts keywords and downloads relevant background videos
+    6. Combines videos with audio and adds scrolling text overlay
+    
+    Args:
+        url: URL of the news article to process
+        
+    Generated files are organized in {OUTPUT_DIR}/{title}/ with:
+    - {SCRIPT_FILE}: Generated news script
+    - {AUDIO_FILE}: Text-to-speech audio
+    - {VIDEO_DIR}/: Downloaded background videos
+    - final_video.mp4: Combined video with audio and text
+    
+    Note:
+        - Requires a running Ollama server at OLLAMA_BASE_URL
+        - Uses configured AI_MODEL for script and keyword generation
+        - Uses configured VOICE_MODEL for text-to-speech
+        - Creates all necessary directories automatically
+        - Validates each step and exits on failure
+    """
+    
+    # Verify Ollama server is running
+    if not verify_ollama_server():
+        return
+    
+    try:
+
+        # Generate script
+        click.echo("Generating news script...")
+        prompt = """
+        Using the news content above, generate a news script to be read by a newscaster. 
+        The script should:
+        - Start with 'Welcome to the Daily News Show'
+        - Include a clear title, location and today's date
+        - Be concise and engaging
+        - Not exceed 2 minutes when read
+        - End with 'Thank you for listening'
+        - Make it plain text only. Do not put '**' in the title or anywhere else.
+        - When referring to a decimal number, for eg 4.99, generate as 4 point 9,9
+        - When referring to a currency, for eg $4.99, generate as 4 dollars 99 cents
+        - When referring to a time, for eg 10:30am, generate as 10-30 am
+        - When referring to a date, for eg 2023-01-01, generate as January 1, 2023
+        - When referring to a percentage, for eg 10%, generate as 10 percent
+        - When referring to a temperature, for eg 20°C, generate as 20 degrees Celsius
+        - When referring to a distance, for eg 100m, generate as 100 meters
+        - When referring to a speed, for eg 100km/h, generate as 100 kilometers per hour
+        - When referring to a weight, for eg 100g, generate as 100 grams
+        - When referring to a volume, for eg 100ml, generate as 100 milliliters        
+        - For acronyms, for eg U.S., generate as US instead 
+        Just return the script, no additional text.
+        """
+        script = generate_script(prompt, url)
+        if not script:
+            click.echo(f"Error: {ERR_SCRIPT_GEN}", err=True)
+            return
+        click.echo("\nGenerated Script:")
+        click.echo(script)
+        
+        # Create a unique title for the output
+        title = create_title(script)
+        if not title:
+            click.echo(f"Error: {ERR_TITLE_GEN}", err=True)
+            return
+        click.echo(f"\nGenerated Title: {title}")
+            
+        # Create output directory
+        output_dir = f"{OUTPUT_DIR}/{title}"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save script to file
+        script_file = f"{output_dir}/{SCRIPT_FILE}"
+        click.echo(f"\nSaving script to {script_file}...")
+        with open(script_file, 'w') as f:
+            f.write(script)
+        
+        # Extract keywords
+        click.echo("\nExtracting keywords...")
+        keywords = extract_keywords(script, output_dir)
+        if not keywords:
+            click.echo(f"Error: {ERR_KEYWORD_GEN}", err=True)
+            return
+            
+        click.echo("\nTop keywords:")
+        for keyword in keywords:
+            click.echo(f"- {keyword}")
+
+        # Convert text to audio
+        click.echo("\nConverting text to audio...")
+        audio_file = f"{output_dir}/{AUDIO_FILE}"
+        convert_text_to_audio(
+            script_file, 
+            audio_file, 
+            voice=VOICE_MODEL, 
+            stream=False, 
+            speed=VOICE_SPEED, 
+            lang=VOICE_LANG, 
+            split_output=None, 
+            format=VOICE_FORMAT, 
+            debug=None, 
+            background_file=None
+        )
+        if not os.path.exists(audio_file):
+            click.echo(f"Error: {ERR_AUDIO_GEN}", err=True)
+            return
+
+        # Download videos
+        click.echo("\nDownloading background videos...")
+        video_dir = f"{output_dir}/{VIDEO_DIR}"
+        os.makedirs(video_dir, exist_ok=True)
+        videos = search_and_download_videos(keywords, output_dir=video_dir)
+        if not videos:
+            click.echo(f"Error: {ERR_VIDEO_GEN}", err=True)
+            return
+        click.echo(f"Downloaded {len(videos)} videos")
+
+        # Combine videos with audio
+        click.echo("\nCombining videos with audio...")
+        combine_videos_with_audio(output_dir)
+        
+        click.echo("\nVideo generation complete!")
+
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
+
+
+def add_picture_in_picture(output_dir: str, main_video: str = "final_video.mp4", 
+                           pip_video: str = "head.mp4", output_file: str = "pip_video.mp4",
+                           pip_width: int = 256, pip_position: str = "bottom-right") -> str:
+    """
+    Add a picture-in-picture effect by overlaying a smaller video on top of the main video.
+    
+    Args:
+        output_dir: Directory containing the videos
+        main_video: Filename of the main (background) video
+        pip_video: Filename of the picture-in-picture (overlay) video
+        output_file: Filename for the output video
+        pip_width: Width of the picture-in-picture video in pixels
+        pip_position: Position of the PIP video ("bottom-right", "bottom-left", "top-right", "top-left")
+        
+    Returns:
+        Path to the output video file or None if there was an error
+    """
+    try:
+        # Check if both videos exist
+        main_video_path = os.path.join(output_dir, main_video)
+        pip_video_path = os.path.join(output_dir, pip_video)
+        output_video_path = os.path.join(output_dir, output_file)
+        
+        if not os.path.exists(main_video_path):
+            click.echo(f"Error: Main video not found at {main_video_path}", err=True)
+            return None
+            
+        if not os.path.exists(pip_video_path):
+            click.echo(f"Error: PIP video not found at {pip_video_path}", err=True)
+            return None
+        
+        # Get main video dimensions
+        main_info = get_video_info(main_video_path)
+        if not main_info:
+            click.echo("Error: Could not get main video information", err=True)
+            return None
+            
+        main_width = main_info.get('width', 1920)
+        main_height = main_info.get('height', 1080)
+        
+        # Calculate PIP video height maintaining aspect ratio
+        pip_info = get_video_info(pip_video_path)
+        if not pip_info:
+            click.echo("Error: Could not get PIP video information", err=True)
+            return None
+            
+        pip_aspect = pip_info.get('width', 16) / pip_info.get('height', 9)
+        pip_height = int(pip_width / pip_aspect)
+        
+        # Calculate PIP position
+        padding = 20  # Padding from the edge of the screen
+        
+        if pip_position == "bottom-right":
+            x_pos = main_width - pip_width - padding
+            y_pos = main_height - pip_height - padding
+        elif pip_position == "bottom-left":
+            x_pos = padding
+            y_pos = main_height - pip_height - padding
+        elif pip_position == "top-right":
+            x_pos = main_width - pip_width - padding
+            y_pos = padding
+        elif pip_position == "top-left":
+            x_pos = padding
+            y_pos = padding
+        else:  # Default to bottom-right
+            x_pos = main_width - pip_width - padding
+            y_pos = main_height - pip_height - padding
+        
+        # Create a temporary directory for intermediate files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # First, resize the PIP video to the desired dimensions
+            resized_pip = os.path.join(temp_dir, "resized_pip.mp4")
+            resize_cmd = [
+                'ffmpeg',
+                '-y',
+                '-i', pip_video_path,
+                '-vf', f'scale={pip_width}:{pip_height}',
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-colorspace', 'bt709',
+                '-color_range', 'tv',
+                '-color_primaries', 'bt709',
+                '-color_trc', 'bt709',
+                '-c:a', 'aac',
+                resized_pip
+            ]
+            
+            click.echo("Resizing PIP video...")
+            subprocess.run(resize_cmd, check=True)
+            
+            # Now overlay the PIP video on the main video
+            overlay_cmd = [
+                'ffmpeg',
+                '-y',
+                '-i', main_video_path,
+                '-i', resized_pip,
+                '-filter_complex', f'[0:v][1:v] overlay={x_pos}:{y_pos}:enable=\'between(t,0,999999)\'',
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-colorspace', 'bt709',
+                '-color_range', 'tv',
+                '-color_primaries', 'bt709',
+                '-color_trc', 'bt709',
+                '-c:a', 'copy',  # Copy audio from the main video
+                output_video_path
+            ]
+            
+            click.echo("Creating picture-in-picture video...")
+            subprocess.run(overlay_cmd, check=True)
+            
+            if os.path.exists(output_video_path):
+                click.echo(f"Picture-in-picture video created successfully: {output_video_path}")
+                return output_video_path
+            else:
+                click.echo(f"Error: {ERR_PIP_VIDEO}", err=True)
+                return None
+                
+    except Exception as e:
+        click.echo(f"Error creating picture-in-picture video: {str(e)}", err=True)
+        return None
+
+@cli.command()
+@click.argument('directory')
+@click.option('--main', '-m', default="final_video.mp4", help="Main video filename")
+@click.option('--pip', '-p', default="head.mp4", help="Picture-in-picture video filename")
+@click.option('--output', '-o', default="pip_video.mp4", help="Output video filename")
+@click.option('--width', '-w', default=320, help="Width of the PIP video in pixels")
+@click.option('--position', '-pos', default="bottom-right", 
+              type=click.Choice(["bottom-right", "bottom-left", "top-right", "top-left"]), 
+              help="Position of the PIP video")
+def pip(directory: str, main: str, pip: str, output: str, width: int, position: str):
+    """
+    Create a picture-in-picture video by overlaying a smaller video on top of the main video.
+    
+    This command takes a main video and a smaller video (PIP) and combines them into
+    a single video with the PIP video displayed in a corner of the main video.
+    
+    Args:
+        directory: Directory containing the videos
+        main: Filename of the main (background) video
+        pip: Filename of the picture-in-picture (overlay) video
+        output: Filename for the output video
+        width: Width of the picture-in-picture video in pixels
+        position: Position of the PIP video (bottom-right, bottom-left, top-right, top-left)
+    """
+    # Ensure the directory exists
+    if not os.path.isdir(directory):
+        click.echo(f"Error: Directory {directory} does not exist", err=True)
+        return
+    
+    result = add_picture_in_picture(directory, main, pip, output, width, position)
+    
+    if result:
+        click.echo(f"Picture-in-picture video created successfully: {result}")
+    else:
+        click.echo(f"Failed to create picture-in-picture video", err=True)
+
+if __name__ == '__main__':
+    cli()
